@@ -126,8 +126,8 @@ module top (
     reg  [63:0] cycle_reg;
     reg  [63:0] instruct_reg;
     wire [31:0] CSR_data;
-    wire [31:0] rs1_data_out;
-    wire [31:0] rs2_data_out;
+    wire [31:0] rs1_data;
+    wire [31:0] rs2_data;
     wire [31:0] imm; 
     wire [6:0]  id_opcode       = if_id_inst[6:0];    // if_id_inst 切出 opcode 給 BranchResolutionUnit 用
     wire [2:0]  id_funct3       = if_id_inst[14:12];  // if_id_inst 切出 funct3 給 BranchResolutionUnit 用
@@ -136,8 +136,8 @@ module top (
     wire [6:0]  opcode          = if_id_inst[6:0];
     wire [4:0]  frs1_addr       = if_id_inst[19:15];
     wire [4:0]  frs2_addr       = if_id_inst[24:20];
-    wire [31:0] frs1_data_out;
-    wire [31:0] frs2_data_out;
+    wire [31:0] frs1_data;
+    wire [31:0] frs2_data;
     // 加一個訊號線，判斷這個東西是f_reg 還是 reg ，不然 Forwarding_unit 可能會誤判，這個標籤要一路傳下去 ；修改 Forwarding Unit
     wire        id_rs1_is_float = (opcode == 7'b1010011); // FPU Op (FADD...)
     wire        id_rs2_is_float = (opcode == 7'b1010011) || (opcode == 7'b0100111); // FPU Op OR FSW
@@ -303,8 +303,8 @@ module top (
         .rd_addr    (mem_wb_rd_addr), 
         .w_data     (wb_write_data),
         .reg_write  (mem_wb_reg_write),
-        .rs1_data   (rs1_data_out),
-        .rs2_data   (rs2_data_out)
+        .rs1_data   (rs1_data),
+        .rs2_data   (rs2_data)
     );
 
     f_RegFile f_RegFile_inst(
@@ -312,8 +312,8 @@ module top (
         .rst        (rst),
         .frs1       (frs1_addr),
         .frs2       (frs2_addr),
-        .frs1_data  (frs1_data_out),
-        .frs2_data  (frs2_data_out),
+        .frs1_data  (frs1_data),
+        .frs2_data  (frs2_data),
         .f_we       (wb_f_reg_write),   // [Connect] 接到 WB 階段的寫入訊號
         .frd        (mem_wb_rd_addr),   // [Connect] 接到 WB 階段的寫入地址
         .f_wdata    (mem_wb_wdata)      // [Connect] 接到 WB 階段的寫入資料
@@ -358,7 +358,7 @@ module top (
     // 1. RS1 的 Forwarding MUX
     ID_Forwarding_Mux u_id_fwd_rs1 (
         .rs_addr          (id_rs1_addr),
-        .reg_rdata        (rs1_data_out),                     
+        .reg_rdata        (rs1_data),                     
         // EX Stage info
         .id_ex_rd_addr    (id_ex_rd_addr),
         .id_ex_reg_write  (id_ex_reg_write),
@@ -568,7 +568,7 @@ module top (
     FPU fpu_inst(
         .a(alu_input_a_mux),   // 來自 Forwarding MUX
         .b(rs2_resolved),      // 來自 Forwarding MUX
-        .funct_op(id_ex_funct3), // 假設用 funct3 分辨 add/sub/min/max
+        .funct3(id_ex_funct3), // 假設用 funct3 分辨 add/sub/min/max
         .out(fpu_result)
     );
     wire [31:0] ex_result_final = (id_ex_rd_is_float) ? fpu_result : alu_result;
