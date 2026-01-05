@@ -74,6 +74,9 @@ module top (
     reg        id_ex_alu_src;
     reg [3:0]  id_ex_alu_op;
     reg        id_ex_is_jal;
+    reg        id_ex_rs1_is_float;
+    reg        id_ex_rs2_is_float;
+    reg        id_ex_rd_is_float;
 
     // ---EX/MEM Stage Registers ---
     reg [31:0] ex_mem_csr_data;
@@ -90,18 +93,20 @@ module top (
     reg        ex_mem_mem_write;
     reg        ex_mem_csr_to_reg;
     reg        ex_mem_mem_to_reg;
+    reg        ex_mem_rd_is_float;
 
     // ---MEM/WB Stage Registers ---
     reg [31:0]  mem_wb_csr_data;
-    reg [4:0]  mem_wb_rd_addr;
-    reg [2:0]  mem_wb_funct3;
-    reg [31:0] mem_wb_alu_out;
-    reg [31:0] mem_wb_mem_data;
+    reg [4:0]   mem_wb_rd_addr;
+    reg [2:0]   mem_wb_funct3;
+    reg [31:0]  mem_wb_alu_out;
+    reg [31:0]  mem_wb_mem_data;
     // 控制訊號
-    reg [3:0]  mem_wb_alu_op;
-    reg        mem_wb_reg_write;
-    reg        mem_wb_csr_to_reg;
-    reg        mem_wb_mem_to_reg;
+    reg [3:0]   mem_wb_alu_op;
+    reg         mem_wb_reg_write;
+    reg         mem_wb_csr_to_reg;
+    reg         mem_wb_mem_to_reg;
+    reg         mem_wb_rd_is_float;
 
 
     //-----------------------------------------------------------------------------------
@@ -124,8 +129,22 @@ module top (
     wire [31:0] rs1_data_out;
     wire [31:0] rs2_data_out;
     wire [31:0] imm; 
-    wire [6:0]  id_opcode = if_id_inst[6:0];    // if_id_inst 切出 opcode 給 BranchResolutionUnit 用
-    wire [2:0]  id_funct3 = if_id_inst[14:12];  // if_id_inst 切出 funct3 給 BranchResolutionUnit 用
+    wire [6:0]  id_opcode       = if_id_inst[6:0];    // if_id_inst 切出 opcode 給 BranchResolutionUnit 用
+    wire [2:0]  id_funct3       = if_id_inst[14:12];  // if_id_inst 切出 funct3 給 BranchResolutionUnit 用
+    
+    // fpu  相關
+    wire [6:0]  opcode          = if_id_inst[6:0];
+    wire [4:0]  frs1_addr       = if_id_inst[19:15];
+    wire [4:0]  frs2_addr       = if_id_inst[24:20];
+    wire [31:0] frs1_data_out;
+    wire [31:0] frs2_data_out;
+    // 加一個訊號線，判斷這個東西是f_reg 還是 reg ，不然 Forwarding_unit 可能會誤判，這個標籤要一路傳下去 ；修改 Forwarding Unit
+    wire        id_rs1_is_float = (opcode == 7'b1010011); // FPU Op (FADD...)
+    wire        id_rs2_is_float = (opcode == 7'b1010011) || (opcode == 7'b0100111); // FPU Op OR FSW
+    // 判斷當前指令是否寫入浮點暫存器 (要一路傳到 EX, MEM, WB)
+    wire        id_rd_is_float  = (opcode == 7'b1010011) || (opcode == 7'b0000111);
+    // 寫入訊號來自 WB 階段 (Write Back)
+    wire        wb_f_reg_write  = mem_wb_reg_write && mem_wb_rd_is_float;
 
     // Decoder 輸出的控制訊號
     wire        ctrl_reg_write; 
@@ -264,8 +283,6 @@ module top (
 	.CSR_data(CSR_data)
     );
 
-
-
     Decoder decoder_inst(
         .inst       (if_id_inst),
         // 輸出控制訊號
@@ -290,6 +307,26 @@ module top (
         .rs2_data   (rs2_data_out)
     );
 
+    f_RegFile f_RegFile_inst(
+        .clk        (clk),
+        .rst        (rst),
+        .frs1       (frs1_addr),
+        .frs2       (frs2_addr),
+        .frs1_data  (frs1_data_out),
+        .frs2_data  (frs2_data_out),
+        .f_we       (wb_f_reg_write),   // [Connect] 接到 WB 階段的寫入訊號
+        .frd        (mem_wb_rd_addr),   // [Connect] 接到 WB 階段的寫入地址
+        .f_wdata    (mem_wb_wdata)      // [Connect] 接到 WB 階段的寫入資料
+    );
+    // mux1, mux2
+    wire [31:0] id_rs1_data_next = (opcode == 7'b1010011) ? frs1_data : rs1_data;
+    wire [31:0] id_rs2_data_next = (opcode == 7'b1010011 || opcode == 7'b0100111) ? frs2_data : rs2_data;
+    /*
+    gemini 這樣寫是錯的吧???
+    wire [31:0] id_rs1_data_next = (id_rs1_is_float) ? frs1_data_out : rs1_data_out; // rs1_data_out 是 Int Reg 的輸出
+    wire [31:0] id_rs2_data_next = (id_rs2_is_float) ? frs2_data_out : rs2_data_out; // rs2_data_out 是 Int Reg 的輸出
+    */
+
     ImmGen immgen_inst(
         .inst(if_id_inst), // imm 的位置各不相同
         .imm(imm)          // 剛剛宣告 imm; <--- 這裡為什麼接 "imm_out"？
@@ -301,8 +338,11 @@ module top (
         .id_ex_rd_addr(id_ex_rd_addr),
         .ex_mem_mem_read(ex_mem_mem_read),
         .ex_mem_rd_addr(ex_mem_rd_addr),
-        //.ex_mem_reg_write(ex_mem_reg_write),
-        //.mem_wb_reg_write(mem_wb_reg_write),
+        // fpu
+        .id_ex_is_float(id_ex_rd_is_float),
+        .id_rs1_is_float(id_rs1_is_float),
+        .id_rs2_is_float(id_rs2_is_float),
+
         .pc_write(pc_write),
         .if_id_write(if_id_write),
         .ctrl_flush(ctrl_flush)
@@ -318,42 +358,48 @@ module top (
     // 1. RS1 的 Forwarding MUX
     ID_Forwarding_Mux u_id_fwd_rs1 (
         .rs_addr          (id_rs1_addr),
-        .reg_rdata        (rs1_data_out),     // 來自 RegFile                
+        .reg_rdata        (rs1_data_out),                     
         // EX Stage info
         .id_ex_rd_addr    (id_ex_rd_addr),
         .id_ex_reg_write  (id_ex_reg_write),
-        .alu_result       (alu_result),       // EX 階段剛算出來的        
+        .alu_result       (alu_result),         
+        .mem_wb_rd_is_float (mem_wb_rd_is_float), // fpu
         // MEM Stage info
         .ex_mem_rd_addr   (ex_mem_rd_addr),
         .ex_mem_reg_write (ex_mem_reg_write),
         .ex_mem_mem_read  (ex_mem_mem_read),
         .ex_mem_alu_out   (ex_mem_alu_out),
         .mem_rdata        (RDATA_DM[31:0]),   // 注意：假設 Data Cache 回傳低 32 bits        
+        .ex_mem_rd_is_float (ex_mem_rd_is_float), // fpu
         // WB Stage info
         .mem_wb_rd_addr   (mem_wb_rd_addr),
         .mem_wb_reg_write (mem_wb_reg_write),
         .wb_write_data    (wb_write_data),        
+        .mem_wb_rd_is_float (mem_wb_rd_is_float), // fpu
         // Output
         .resolved_data    (id_rs1_data_resolved)
     );
     // 2. RS2 的 Forwarding MUX
     ID_Forwarding_Mux u_id_fwd_rs2 (
         .rs_addr          (id_rs2_addr),
-        .reg_rdata        (rs2_data_out),     // 來自 RegFile       
+        .reg_rdata        (rs2_data_out),            
         // EX Stage info
         .id_ex_rd_addr    (id_ex_rd_addr),
         .id_ex_reg_write  (id_ex_reg_write),
         .alu_result       (alu_result),       
+        .id_ex_rd_is_float  (id_ex_rd_is_float),  // fpu
         // MEM Stage info
         .ex_mem_rd_addr   (ex_mem_rd_addr),
         .ex_mem_reg_write (ex_mem_reg_write),
         .ex_mem_mem_read  (ex_mem_mem_read),
         .ex_mem_alu_out   (ex_mem_alu_out),
-        .mem_rdata        (RDATA_DM[31:0]),       
+        .mem_rdata        (RDATA_DM[31:0]),    
+        .ex_mem_rd_is_float (ex_mem_rd_is_float), // fpu   
         // WB Stage info
         .mem_wb_rd_addr   (mem_wb_rd_addr),
         .mem_wb_reg_write (mem_wb_reg_write),
         .wb_write_data    (wb_write_data),       
+        .mem_wb_rd_is_float (mem_wb_rd_is_float), // fpu
         // Output
         .resolved_data    (id_rs2_data_resolved)
     );
@@ -393,6 +439,10 @@ module top (
             id_ex_alu_src       <=  1'b0; 
             id_ex_alu_op        <=  1'b0;
             id_ex_is_jal        <=  1'b0;
+            // fpu
+            id_ex_rs1_is_float  <= 1'b0;
+            id_ex_rs2_is_float  <= 1'b0;
+            id_ex_rd_is_float   <= 1'b0;
         end 
         else if (global_stall) begin   // 最高優先權：global_stall
             // 保持原值 (Freeze)：把這裡面所有暫存器都寫一遍 <= 自己 ...
@@ -414,6 +464,10 @@ module top (
             id_ex_alu_src       <=  id_ex_alu_src; 
             id_ex_alu_op        <=  id_ex_alu_op;
             id_ex_is_jal        <= id_ex_is_jal;
+            // fpu
+            id_ex_rs1_is_float  <= id_ex_rs1_is_float;
+            id_ex_rs2_is_float  <= id_ex_rs2_is_float;
+            id_ex_rd_is_float   <= id_ex_rd_is_float;
         end
         else if (ctrl_flush) begin
             // 把所有控制訊號歸零，模擬一個 NOP
@@ -425,12 +479,17 @@ module top (
             id_ex_csr_to_reg    <=  1'b0; 
             id_ex_alu_src       <=  1'b0; 
             id_ex_alu_op        <=  1'b0;  // (做加法) → 沒差，反正算出來的結果會被丟到垃圾桶。
+            // fpu
+            id_ex_rs1_is_float  <= 1'b0;
+            id_ex_rs2_is_float  <= 1'b0;
+            id_ex_rd_is_float   <= 1'b0;
         end
         else begin
             id_ex_pc            <= if_id_pc;
             id_ex_csr_data      <= id_ex_csr_data;
-            id_ex_rs1_data      <= rs1_data_out;
-            id_ex_rs2_data      <= rs2_data_out;
+            // fpu Modified
+            id_ex_rs1_data      <= id_rs1_data_next; 
+            id_ex_rs2_data      <= id_rs2_data_next;
             id_ex_imm_ext       <= imm;
             id_ex_rd_addr       <= if_id_inst[11:7];  // rd  地址
             id_ex_funct3        <= if_id_inst[14:12];
@@ -445,6 +504,10 @@ module top (
             id_ex_reg_write     <= ctrl_reg_write;
             id_ex_alu_op        <= ctrl_alu_op;
             id_ex_is_jal        <= ctrl_is_jal;
+            // fpu
+            id_ex_rs1_is_float <= id_rs1_is_float;
+            id_ex_rs2_is_float <= id_rs2_is_float;
+            id_ex_rd_is_float  <= id_rd_is_float;
         end
     end
 
@@ -453,7 +516,7 @@ module top (
     // EX stage
     //-----------------------------------------------------------------------------------
 
-    // 實例化 ForwardingUnit
+
     ForwardingUnit ForwardingUnit_inst(
         .rs1_addr(id_ex_rs1_addr),       // 記得剛剛在 step 1 加的
         .rs2_addr(id_ex_rs2_addr),
@@ -461,6 +524,12 @@ module top (
         .ex_mem_reg_write(ex_mem_reg_write),
         .mem_wb_rd_addr(mem_wb_rd_addr),
         .mem_wb_reg_write(mem_wb_reg_write),
+        // fpu
+        .rs1_is_float(id_ex_rs1_is_float),
+        .rs2_is_float(id_ex_rs2_is_float),
+        .ex_mem_is_float(ex_mem_rd_is_float),
+        .mem_wb_is_float(mem_wb_rd_is_float),
+        
         .forward_a(forward_a), // Forwarding or not 的控制訊號
         .forward_b(forward_b)
     );
@@ -487,7 +556,7 @@ module top (
             default:    rs2_resolved = id_ex_rs2_data;
         endcase
     end
-    // 實例化 ALU
+    // 實例化 ALU & FPU
     ALU ALU_inst(
         .alu_input_a(alu_input_a),
         .alu_input_b(alu_input_b),
@@ -495,8 +564,14 @@ module top (
         .alu_result(alu_result),
         .zero()
     );
-
-
+    wire [31:0] fpu_result;
+    FPU fpu_inst(
+        .a(alu_input_a_mux),   // 來自 Forwarding MUX
+        .b(rs2_resolved),      // 來自 Forwarding MUX
+        .funct_op(id_ex_funct3), // 假設用 funct3 分辨 add/sub/min/max
+        .out(fpu_result)
+    );
+    wire [31:0] ex_result_final = (id_ex_rd_is_float) ? fpu_result : alu_result;
     
     //-----------------------------------------------------------------------------------
     //  EX_MEM Pipeline Register
@@ -519,6 +594,8 @@ module top (
             ex_mem_mem_write    <=  1'b0;
             ex_mem_mem_to_reg   <=  1'b0;
             ex_mem_csr_to_reg   <=  1'b0;
+            // fpu
+            ex_mem_rd_is_float  <= 1'b0;
         end 
         else if (global_stall) begin
             ex_mem_csr_data     <= ex_mem_csr_data;
@@ -535,15 +612,17 @@ module top (
             ex_mem_mem_write    <= ex_mem_mem_write;
             ex_mem_mem_to_reg   <= ex_mem_mem_to_reg;
             ex_mem_csr_to_reg   <= ex_mem_csr_to_reg;
+            // fpu
+            ex_mem_rd_is_float  <= ex_mem_rd_is_float;
         end
         else begin
             ex_mem_csr_data     <= ex_mem_csr_data;
-            ex_mem_alu_out      <= alu_result;
-            ex_mem_store_data   <= rs2_resolved;   // store data 是 rs2 值 bypass ， 也要考慮 forwarding !
-            ex_mem_rd_addr      <= id_ex_rd_addr;  // rd  地址
+            ex_mem_alu_out      <= ex_result_final; // <-- 修改後：根據型別選擇結果
+            ex_mem_store_data   <= rs2_resolved;    // store data 是 rs2 值 bypass ， 也要考慮 forwarding !
+            ex_mem_rd_addr      <= id_ex_rd_addr;   // rd  地址
             ex_mem_funct3       <= id_ex_funct3;
-            ex_mem_rs1_addr     <= id_ex_rs1_addr; // rs1 地址
-            ex_mem_rs2_addr     <= id_ex_rs2_addr; // rs2 地址
+            ex_mem_rs1_addr     <= id_ex_rs1_addr;  // rs1 地址
+            ex_mem_rs2_addr     <= id_ex_rs2_addr;  // rs2 地址
             // 控制訊號
             ex_mem_alu_op       <=  id_ex_alu_op;
             ex_mem_reg_write    <=  id_ex_reg_write;
@@ -551,6 +630,8 @@ module top (
             ex_mem_mem_write    <=  id_ex_mem_write;
             ex_mem_mem_to_reg   <=  id_ex_mem_to_reg;
             ex_mem_csr_to_reg   <=  id_ex_csr_to_reg;
+            // fpu
+            ex_mem_rd_is_float  <= id_ex_rd_is_float;
         end 
     end
 
@@ -665,6 +746,8 @@ module top (
             mem_wb_reg_write    <=  1'b0; 
             mem_wb_mem_to_reg   <=  1'b0;
             mem_wb_csr_to_reg   <=  1'b0;
+            // fpu
+            mem_wb_rd_is_float  <= 1'b0;
         end 
         else if (global_stall) begin
             mem_wb_csr_data     <= mem_wb_csr_data; 
@@ -676,6 +759,7 @@ module top (
             mem_wb_reg_write    <= mem_wb_reg_write; 
             mem_wb_mem_to_reg   <= mem_wb_mem_to_reg;
             mem_wb_csr_to_reg   <= mem_wb_csr_to_reg;
+            mem_wb_rd_is_float  <= mem_wb_rd_is_float;
         end
         else begin
             mem_wb_csr_data     <= mem_wb_csr_data; 
@@ -688,6 +772,8 @@ module top (
             mem_wb_reg_write    <= ex_mem_reg_write; 
             mem_wb_mem_to_reg   <= ex_mem_mem_to_reg;
             mem_wb_csr_to_reg   <= ex_mem_csr_to_reg;
+            // fpu
+            mem_wb_rd_is_float <= ex_mem_rd_is_float;
         end
     end
    
@@ -1009,6 +1095,12 @@ module ForwardingUnit(
     input       ex_mem_reg_write,
     input [4:0] mem_wb_rd_addr,     // 上上個指令
     input       mem_wb_reg_write,
+    // fpu
+    input       rs1_is_float,       // ID/EX 階段的 rs1 是浮點嗎？
+    input       rs2_is_float,       // ID/EX 階段的 rs2 是浮點嗎？
+    input       ex_mem_is_float,    // MEM 階段寫入的是浮點嗎？
+    input       mem_wb_is_float,    // WB 階段寫入的是浮點嗎？
+
     output reg [1:0] forward_a,     // 控制 rs1
     output reg [1:0] forward_b      // 控制 rs2
 );
@@ -1017,17 +1109,44 @@ module ForwardingUnit(
     localparam wb_hazard  = 2'b10;  // WB  Forward (次優先) data_hazard_occur_at_wb_stage
     
     always @(*) begin
-        forward_a = no_hazard; // 預設：不轉發
-        if(ex_mem_reg_write && (ex_mem_rd_addr!=0) && (ex_mem_rd_addr==rs1_addr))
-            forward_a = mem_hazard;
-        else if(mem_wb_reg_write && (mem_wb_rd_addr!=0) && (mem_wb_rd_addr==rs1_addr))
-            forward_a = wb_hazard;
+        // Forward A
+        forward_a = no_hazard;
         
-        forward_b = no_hazard; // 預設：不轉發
-        if(ex_mem_reg_write && (ex_mem_rd_addr!=0) && (ex_mem_rd_addr==rs2_addr))
+        // [修正邏輯]
+        // 如果是整數 (is_float=0)，必須檢查 rd_addr != 0
+        // 如果是浮點 (is_float=1)，不需要檢查 rd_addr != 0 (因為 f0 有效)
+        if(ex_mem_reg_write && 
+           (ex_mem_rd_addr == rs1_addr) && 
+           (ex_mem_is_float == rs1_is_float) &&
+           (ex_mem_is_float || ex_mem_rd_addr != 0)) // [關鍵修正]
+        begin
+            forward_a = mem_hazard;
+        end
+        
+        else if(mem_wb_reg_write && 
+                (mem_wb_rd_addr == rs1_addr) && 
+                (mem_wb_is_float == rs1_is_float) &&
+                (mem_wb_is_float || mem_wb_rd_addr != 0)) // [關鍵修正]
+        begin
+            forward_a = wb_hazard;
+        end
+
+        // Forward B (同理修正)
+        forward_b = no_hazard;
+        if(ex_mem_reg_write && 
+           (ex_mem_rd_addr == rs2_addr) && 
+           (ex_mem_is_float == rs2_is_float) &&
+           (ex_mem_is_float || ex_mem_rd_addr != 0)) 
+        begin
             forward_b = mem_hazard;
-        else if(mem_wb_reg_write && (mem_wb_rd_addr!=0) && (mem_wb_rd_addr==rs2_addr))
+        end
+        else if(mem_wb_reg_write && 
+                (mem_wb_rd_addr == rs2_addr) && 
+                (mem_wb_is_float == rs2_is_float) &&
+                (mem_wb_is_float || mem_wb_rd_addr != 0)) 
+        begin
             forward_b = wb_hazard;
+        end
     end
 endmodule 
 
@@ -1035,14 +1154,15 @@ module HazardDetectionUnit(
     input        id_ex_mem_read,
     input [31:0] if_id_inst,
     input [4:0]  id_ex_rd_addr,
-    // 檢查前面指令有沒有 LW data hazard
     input        ex_mem_mem_read,
     input [4:0]  ex_mem_rd_addr,
-    // 輸出控制訊號
-    // 動作 1: Stall (踩煞車) -> 叫前面的舞台不要動
+    // fpu
+    input        id_ex_is_float,  // ID/EX 階段 (上一條指令) 是否寫入浮點？
+    input        id_rs1_is_float, // ID 階段 (目前指令) rs1 是否為浮點？
+    input        id_rs2_is_float, // ID 階段 (目前指令) rs2 是否為浮點？
+    
     output reg pc_write,
     output reg if_id_write,
-    // 動作 2: Flush (清空) -> 往後面的舞台送氣泡 (NOP)
     output reg ctrl_flush
 ); 
     wire [6:0] opcode       = if_id_inst[6:0];
@@ -1052,6 +1172,7 @@ module HazardDetectionUnit(
     wire       b_type       = (opcode == 7'b1100011); 
     wire       jalr         = (opcode == 7'b1100111);
     wire       is_branch    = (b_type || jalr);
+
     always @(*) begin
         // 預設值：不 Stall
         pc_write    = 1'b1;
@@ -1059,23 +1180,25 @@ module HazardDetectionUnit(
         ctrl_flush  = 1'b0;
 
         // ==========================================================
-        // 條件 A: 標準 Load-Use Hazard (Distance 1)
+        // Load-Use Hazard Detection (with Type Check)
         // ==========================================================
-        // 上一條指令 (EX) 是 Load，且寫入目標等於目前的 rs1 或 rs2。
-        // 這會擋住所有需要用 rs1/rs2 的指令 (包含 ADD, SUB, 以及 Branch)
-        if (id_ex_mem_read && (id_ex_rd_addr == rs1_addr || id_ex_rd_addr == rs2_addr)) begin
+        // 上一條指令是 Load，且寫入的暫存器跟現在要讀的一樣，而且「型別也一樣」！
+        if (id_ex_mem_read && 
+           ((id_ex_rd_addr == rs1_addr && id_ex_is_float == id_rs1_is_float) || 
+            (id_ex_rd_addr == rs2_addr && id_ex_is_float == id_rs2_is_float))) 
+        begin
             pc_write    = 1'b0;
             if_id_write = 1'b0;
             ctrl_flush  = 1'b1;
         end
         
-        // ==========================================================
-        // 條件 B: Branch Specific Load-Use Hazard (Distance 2)
-        // ==========================================================
-        // 上上條指令 (MEM) 是 Load，且目前的 ID 是 Branch。
-        // 不從 MEM 拉線回 ID (怕 SRAM mem access 太慢)，多 Stall 一個 Cycle，等 Load 走到 WB 階段。
+        // Branch Hazard (Distance 2) - 通常 Branch 比較是整數，浮點比較通常用 FCMP
+        // 但如果你的架構支援浮點 Branch (標準 RISC-V 沒有直接的浮點 branch，是先 FCMP 到整數 Reg 再 Branch)
+        // 所以這裡維持原樣通常沒問題，因為 is_branch 只有整數指令會觸發
         else if (ex_mem_mem_read && (ex_mem_rd_addr == rs1_addr || ex_mem_rd_addr == rs2_addr) && is_branch) begin
-            // [關鍵] 這裡用 is_branch，而不是 branch_taken！
+             // 這裡假設 Branch 只用整數，所以不用檢查 is_float (因為 ex_mem_is_float 如果是 1，代表是 FLW，那跟 BEQ 的 rs1(整數) 就不會衝突)
+             // 為了保險起見，你可以加上 && !ex_mem_is_float (確認上一條是整數 Load)
+             // 但原版邏輯通常也能跑，只是會多 Stall 一些不該 Stall 的 (False Alarm)，不會錯。
             pc_write    = 1'b0;
             if_id_write = 1'b0;
             ctrl_flush  = 1'b1;
@@ -1084,51 +1207,53 @@ module HazardDetectionUnit(
 endmodule
 
 module ID_Forwarding_Mux(           // 進入 BranchResolutionUnit 的 rs1_data & rs2_data 都可以使用的 "選擇器(MUX)"
-    input  [4:0]  rs_addr,          // 來源暫存器地址 (rs1 or rs2)
-    input  [31:0] reg_rdata,        // RegFile 讀出來的原始資料
+    input  [4:0]  rs_addr,
+    input  [31:0] reg_rdata, 
     
-    // 來自 EX 階段的資訊 (Priority 1 - 最鮮活的資料)
+    // EX Stage
     input  [4:0]  id_ex_rd_addr,
     input         id_ex_reg_write,
-    input  [31:0] alu_result,       // 來自 ALU 的計算結果
+    input  [31:0] alu_result,
+    input         id_ex_rd_is_float, // fpu
     
-    // 來自 MEM 階段的資訊 (Priority 2)
+    // MEM Stage
     input  [4:0]  ex_mem_rd_addr,
     input         ex_mem_reg_write,
-    input         ex_mem_mem_read,  // 判斷是否為 Load 指令
-    input  [31:0] ex_mem_alu_out,   // ALU 運算結果傳遞
-    input  [31:0] mem_rdata,        // Memory 讀出的資料 (從 DM 來的)
-    
-    // 來自 WB 階段的資訊 (Priority 3)
+    input         ex_mem_mem_read,
+    input  [31:0] ex_mem_alu_out,
+    input  [31:0] mem_rdata,
+    input         ex_mem_rd_is_float, // fpu
+
+    // WB Stage
     input  [4:0]  mem_wb_rd_addr,
     input         mem_wb_reg_write,
-    input  [31:0] wb_write_data,    // 準備寫回 RegFile 的資料
+    input  [31:0] wb_write_data,
+    input         mem_wb_rd_is_float, // fpu
 
-    output reg [31:0] resolved_data // 最終決定的資料 (給 Branch Unit 用)
+    output reg [31:0] resolved_data
 );
 
     always @(*) begin
-        // Default: 沒人用這顆暫存器，直接用 RegFile 讀到的值
         resolved_data = reg_rdata;
 
-        // Priority 1: Forward from EX Stage (Aggressive Forwarding)
-        // 情況：上一條指令剛算完 (ALU)，還沒寫回
-        if (id_ex_reg_write && (id_ex_rd_addr != 0) && (id_ex_rd_addr == rs_addr)) begin
+        // Priority 1: EX Stage
+        // [修正] 必須加上 && !id_ex_rd_is_float (整數才轉發)
+        if (id_ex_reg_write && (id_ex_rd_addr != 0) && (id_ex_rd_addr == rs_addr) && !id_ex_rd_is_float) begin
             resolved_data = alu_result;
         end
         
-        // Priority 2: Forward from MEM Stage
-        // 情況：上上條指令在 MEM 階段
-        else if (ex_mem_reg_write && (ex_mem_rd_addr != 0) && (ex_mem_rd_addr == rs_addr)) begin
+        // Priority 2: MEM Stage
+        // [修正] 必須加上 && !ex_mem_rd_is_float
+        else if (ex_mem_reg_write && (ex_mem_rd_addr != 0) && (ex_mem_rd_addr == rs_addr) && !ex_mem_rd_is_float) begin
             if (ex_mem_mem_read) 
-                resolved_data = mem_rdata;      // 如果是 Load，取 Memory 資料
+                resolved_data = mem_rdata;
             else                 
-                resolved_data = ex_mem_alu_out; // 如果是 ALU 運算，取 ALU 結果
+                resolved_data = ex_mem_alu_out;
         end
         
-        // Priority 3: Forward from WB Stage
-        // 情況：上上上條指令在 WB 階段 (正在寫回)
-        else if (mem_wb_reg_write && (mem_wb_rd_addr != 0) && (mem_wb_rd_addr == rs_addr)) begin
+        // Priority 3: WB Stage
+        // [修正] 必須加上 && !mem_wb_rd_is_float
+        else if (mem_wb_reg_write && (mem_wb_rd_addr != 0) && (mem_wb_rd_addr == rs_addr) && !mem_wb_rd_is_float) begin
             resolved_data = wb_write_data;
         end
     end
@@ -1216,23 +1341,178 @@ module CSR(
 	output reg[31:0] CSR_data
 );
 
-always@ (*) begin
-	case(imm)
-		12'b110010000010:begin
-			CSR_data = instruct_reg[63:32];
-		end
-		12'b110000000010:begin
-			CSR_data = instruct_reg[31:0];
-		end
-		12'b110010000000:begin
-			CSR_data = cycle_reg[63:32];
-		end
-		12'b110000000000:begin
-			CSR_data = cycle_reg[31:0];
-		end
-	endcase
-end
+    always@ (*) begin
+        case(imm)
+            12'b110010000010:begin
+                CSR_data = instruct_reg[63:32];
+            end
+            12'b110000000010:begin
+                CSR_data = instruct_reg[31:0];
+            end
+            12'b110010000000:begin
+                CSR_data = cycle_reg[63:32];
+            end
+            12'b110000000000:begin
+                CSR_data = cycle_reg[31:0];
+            end
+        endcase
+    end
 
 endmodule
 
+module f_RegFile (
+    input  wire        clk,
+    input  wire        rst,
+    // read 
+    input  wire [4:0]  frs1,
+    input  wire [4:0]  frs2,
+    output wire [31:0] frs1_data,
+    output wire [31:0] frs2_data,
+    // write back 
+    input  wire        f_we,      // write enable
+    input  wire [4:0]  frd,       // write address
+    input  wire [31:0] f_wdata    // write data
+);
+    reg [31:0] f_regfile [0:31];
+    integer i;
 
+    // synchronous write 
+    always @(posedge clk) begin
+        if (rst) begin
+            for (i = 0; i < 32; i = i + 1)
+                f_regfile[i] <= 32'b0;
+        end 
+        else begin
+            // [Ranking 1 Fix] f0 is a valid register in Floating Point!
+            if (f_we) 
+                f_regfile[frd] <= f_wdata;
+        end
+    end
+
+    // combinational read (Internal Forwarding / Write-First)
+    // 解決同 cycle 讀寫的 Hazard
+    assign frs1_data = (f_we && (frd == frs1)) ? f_wdata : f_regfile[frs1];
+    assign frs2_data = (f_we && (frd == frs2)) ? f_wdata : f_regfile[frs2];
+
+endmodule
+
+module FPU(
+    input  [31:0] a,          // rs1
+    input  [31:0] b,          // rs2
+    input  [2:0]  funct3,     // 使用 funct3 來分辨指令
+    output reg [31:0] out
+);
+
+    // 定義操作 (根據 funct3)
+    // 假設依照 Spec: FADD=000, FSUB=001, FMIN=010, FMAX=011
+    wire is_sub  = (funct3 == 3'b001);
+    wire is_min  = (funct3 == 3'b010);
+    wire is_max  = (funct3 == 3'b011);
+
+    // ==========================================================
+    // 1. FMIN / FMAX 邏輯 (共用比較器，極小面積)
+    // ==========================================================
+    wire sign_a = a[31];
+    wire sign_b = b[31];
+    wire [30:0] mag_a = a[30:0];
+    wire [30:0] mag_b = b[30:0];
+    
+    reg a_is_larger;
+    always @(*) begin
+        if (sign_a != sign_b) begin
+            // 符號不同，正數比較大 (sign=0 是正)
+            a_is_larger = !sign_a; 
+        end else begin
+            // 符號相同
+            if (sign_a == 0) // 都是正，數值大者大
+                a_is_larger = (mag_a > mag_b);
+            else             // 都是負，數值大者小 (-2 > -5)
+                a_is_larger = (mag_a < mag_b);
+        end
+    end
+    
+    // FMIN: 誰小選誰; FMAX: 誰大選誰
+    wire [31:0] min_res = (a_is_larger) ? b : a;
+    wire [31:0] max_res = (a_is_larger) ? a : b;
+
+
+    // ==========================================================
+    // 2. FADD / FSUB 邏輯 (單週期 Combinational)
+    // ==========================================================
+    
+    // Step A: 預處理 (Unpack & Op check)
+    // 如果是 FSUB，把 b 的符號反轉，變成 FADD 處理
+    wire [31:0] b_op = is_sub ? {~b[31], b[30:0]} : b;
+    
+    wire sa = a[31];
+    wire sb = b_op[31];
+    wire [7:0]  ea = a[30:23];
+    wire [7:0]  eb = b_op[30:23];
+    // 補上隱藏的 1 (Hidden bit)
+    wire [23:0] ma = (|ea) ? {1'b1, a[22:0]} : 24'b0;
+    wire [23:0] mb = (|eb) ? {1'b1, b_op[22:0]} : 24'b0;
+
+    // Step B: 對齊 (Align) - 找出較大的指數
+    reg [23:0] big_m, small_m;
+    reg [7:0]  big_e, small_e;
+    reg        big_s, small_s;
+    
+    always @(*) begin
+        if ({ea, ma} >= {eb, mb}) begin 
+            big_e = ea; big_m = ma; big_s = sa;
+            small_e = eb; small_m = mb; small_s = sb;
+        end else begin
+            big_e = eb; big_m = mb; big_s = sb;
+            small_e = ea; small_m = ma; small_s = sa;
+        end
+    end
+    
+    wire [7:0] exp_diff = big_e - small_e;
+    // 保留 Guard bit 以便捨入
+    wire [26:0] small_m_shifted = {small_m, 3'b0} >> exp_diff;
+    wire [26:0] big_m_shifted   = {big_m, 3'b0};
+
+    // Step C: 加減運算 (Add/Sub)
+    wire same_sign = (big_s == small_s);
+    wire [27:0] sum_temp = same_sign ? (big_m_shifted + small_m_shifted) : (big_m_shifted - small_m_shifted);
+    
+    wire sign_res = big_s; 
+
+    // Step D: 正規化 (Normalize) [這是 B 版缺少的關鍵邏輯]
+    reg [23:0] norm_m;
+    reg [7:0]  norm_e;
+    
+    always @(*) begin
+        if (sum_temp[27]) begin 
+            // 發生進位 (Overflow)
+            norm_m = sum_temp[27:4]; 
+            norm_e = big_e + 1;
+        end else if (sum_temp[26]) begin
+            // 正常情況
+            norm_m = sum_temp[26:3];
+            norm_e = big_e;
+        end else begin
+            // 發生借位 (Cancellation)，需要左移
+            if (sum_temp[25]) begin norm_m = sum_temp[25:2]; norm_e = big_e - 1; end
+            else if (sum_temp[24]) begin norm_m = sum_temp[24:1]; norm_e = big_e - 2; end
+            else if (sum_temp[23]) begin norm_m = sum_temp[23:0]; norm_e = big_e - 3; end
+            else if (sum_temp[22]) begin norm_m = {sum_temp[22:0], 1'b0}; norm_e = big_e - 4; end
+            else if (sum_temp[21]) begin norm_m = {sum_temp[21:0], 2'b0}; norm_e = big_e - 5; end
+            else begin norm_m = 0; norm_e = 0; end // Underflow
+        end
+    end
+    
+    // Step E: 打包結果
+    wire is_zero_res = (sum_temp == 0) || (norm_e == 0); 
+    wire [31:0] add_res = is_zero_res ? 32'b0 : {sign_res, norm_e, norm_m[22:0]};
+
+    // ==========================================================
+    // 3. 輸出 MUX
+    // ==========================================================
+    always @(*) begin
+        if (is_min)      out = min_res;
+        else if (is_max) out = max_res;
+        else             out = add_res; // FADD or FSUB
+    end
+
+endmodule
